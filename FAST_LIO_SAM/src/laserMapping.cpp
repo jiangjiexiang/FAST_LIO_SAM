@@ -33,6 +33,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <algorithm>
 #include <mutex>
 #include <math.h>
 #include <thread>
@@ -222,6 +223,7 @@ float historyKeyframeSearchRadius;   // 回环检测 radius kdtree搜索半径
 float historyKeyframeSearchTimeDiff; //  帧间时间阈值
 int historyKeyframeSearchNum;        //   回环时多少个keyframe拼成submap
 float historyKeyframeFitnessScore;   // icp 匹配阈值
+float loopClosureWeight;             // 闭环约束权重，越大表示约束越强
 bool potentialLoopFlag = false;
 
 ros::Publisher pubHistoryKeyFrames; //  发布 loop history keyframe submap
@@ -1061,9 +1063,11 @@ void performLoopClosure()
     gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
     gtsam::Vector Vector6(6);
     float noiseScore = icp.getFitnessScore() ; //  loop_clousre  noise from icp
-    Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
+    float weightedNoiseScore = std::max(noiseScore / std::max(loopClosureWeight, 1e-3f), 1e-6f);
+    Vector6 << weightedNoiseScore, weightedNoiseScore, weightedNoiseScore,
+        weightedNoiseScore, weightedNoiseScore, weightedNoiseScore;
     gtsam::noiseModel::Diagonal::shared_ptr constraintNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
-    std::cout << "loopNoiseQueue   =   " << noiseScore << std::endl;
+    std::cout << "loopNoiseQueue(raw/weighted)   =   " << noiseScore << " / " << weightedNoiseScore << std::endl;
 
     // 添加闭环因子需要的数据
     mtx.lock();
@@ -2175,6 +2179,7 @@ int main(int argc, char **argv)
     nh.param<float>("historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff, 30.0);
     nh.param<int>("historyKeyframeSearchNum", historyKeyframeSearchNum, 25);
     nh.param<float>("historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3);
+    nh.param<float>("loopClosureWeight", loopClosureWeight, 1.0);
 
     // gnss
     nh.param<string>("common/gnss_topic", gnss_topic,"/gps/fix");
