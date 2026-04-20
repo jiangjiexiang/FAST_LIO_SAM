@@ -58,6 +58,8 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
+
+list(APPEND CMAKE_MODULE_PATH "/usr/share/cmake/geographiclib")
 find_package (GeographicLib REQUIRED)
 
 find_package( GTSAMCMakeTools )
