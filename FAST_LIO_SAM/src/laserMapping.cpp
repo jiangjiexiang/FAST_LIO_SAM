@@ -312,6 +312,7 @@ ros::ServiceServer srvSaveMap;
 ros::ServiceServer srvSavePose;
 bool savePCD;               // 是否保存地图
 string savePCDDirectory;    // 保存路径
+int pose_log_interval = 20; // 每隔多少帧记录一次 pose.txt
 
 
 /**
@@ -1503,6 +1504,31 @@ bool sync_packages(MeasureGroup &meas)
 }
 
 int process_increments = 0;
+
+void logPoseSample(std::ofstream &ofs, int interval, int &counter)
+{
+    if (!ofs.is_open() || interval <= 0)
+        return;
+
+    counter++;
+    if (counter % interval != 0)
+        return;
+
+    Eigen::Vector3d rpy = state_point.rot.matrix().eulerAngles(2, 1, 0);
+    double roll = rpy(2);
+    double pitch = rpy(1);
+    double yaw = rpy(0);
+
+    ofs << std::fixed << std::setprecision(6)
+        << lidar_end_time << " "
+        << odomAftMapped.pose.pose.position.x << " "
+        << odomAftMapped.pose.pose.position.y << " "
+        << odomAftMapped.pose.pose.position.z << " "
+        << roll << " "
+        << pitch << " "
+        << yaw << std::endl;
+}
+
 void map_incremental()
 {
     PointVector PointToAdd;            //需要加入到ikd-tree中的点云
@@ -2148,6 +2174,7 @@ int main(int argc, char **argv)
     nh.param<int>("point_filter_num", p_pre->point_filter_num, 2);
     nh.param<bool>("feature_extract_enable", p_pre->feature_enabled, false);
     nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+    nh.param<int>("publish/pose_log_interval", pose_log_interval, 20);
     nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en, true);
     nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
@@ -2260,14 +2287,18 @@ int main(int argc, char **argv)
     string pos_log_dir = root_dir + "/Log/pos_log.txt";
     fp = fopen(pos_log_dir.c_str(), "w");
 
-    ofstream fout_pre, fout_out, fout_dbg;
+    ofstream fout_pre, fout_out, fout_dbg, fout_pose;
     fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
     fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
     fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+    fout_pose.open(DEBUG_FILE_DIR("pose.txt"), ios::out);
+    int pose_log_counter = 0;
     if (fout_pre && fout_out)
         cout << "~~~~" << ROOT_DIR << " file opened" << endl;
     else
         cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
+    if (fout_pose)
+        fout_pose << "# time x y z roll pitch yaw" << endl;
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
@@ -2437,6 +2468,7 @@ int main(int argc, char **argv)
             correctPoses();
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            logPoseSample(fout_pose, pose_log_interval, pose_log_counter);
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();
@@ -2513,6 +2545,7 @@ int main(int argc, char **argv)
 
     fout_out.close();
     fout_pre.close();
+    fout_pose.close();
 
     if (runtime_pos_log)
     {

@@ -13,8 +13,8 @@ preprocess:
     blind: 1.0
 
 mapping:
-    acc_cov: 0.1
-    gyr_cov: 0.1
+    acc_cov: 0.2
+    gyr_cov: 0.3
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
     # Internal code clamps effective FOV <= 179.9 deg.
@@ -22,7 +22,7 @@ mapping:
     det_range:     120.0
     extrinsic_est_en:  false
     # Replace with your calibrated LiDAR-in-IMU extrinsic.
-    extrinsic_T: [ 0.0, 0.0, 0.0 ]
+    extrinsic_T: [ 0.02, 0.0, 0.0 ]
     extrinsic_R: [ 1, 0, 0,
                    0, 1, 0,
                    0, 0, 1 ]
@@ -39,7 +39,7 @@ publish:
     scan_bodyframe_pub_en: true
 
 pcd_save:
-    pcd_save_en: true
+    pcd_save_en: false
     interval: -1
 
 # voxel filter params
@@ -81,9 +81,13 @@ poseCovThreshold: 0
 globalMapVisualizationSearchRadius: 100.0
 globalMapVisualizationPoseDensity: 10
 globalMapVisualizationLeafSize: 1.0
-visulize_IkdtreeMap: true
-recontructKdTree: true
+visulize_IkdtreeMap: false
+recontructKdTree: false
 
 # Export settings
-savePCD: true
+savePCD: false
 savePCDDirectory: "/fast_lio_sam_ws/src/FAST_LIO_SAM/PCD/"
+
+
+publish:
+    pose_log_interval: 100
