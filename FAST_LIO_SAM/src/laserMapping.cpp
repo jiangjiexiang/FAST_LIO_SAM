@@ -40,6 +40,9 @@
 #include <fstream>
 #include <csignal>
 #include <unistd.h>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
@@ -109,6 +112,7 @@
 #include <sstream>
 #include <fstream>
 #include <iomanip>
+#include <cstring>
 
 // using namespace gtsam;
 
@@ -239,6 +243,8 @@ vector<pair<int, int>> loopIndexQueue;
 vector<gtsam::Pose3> loopPoseQueue;
 vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
 deque<std_msgs::Float64MultiArray> loopInfoVec;
+int lastLoopKeyframeIndex = -1;
+double lastLoopTime = -1.0;
 
 nav_msgs::Path globalPath;
 
@@ -313,6 +319,44 @@ ros::ServiceServer srvSavePose;
 bool savePCD;               // 是否保存地图
 string savePCDDirectory;    // 保存路径
 int pose_log_interval = 20; // 每隔多少帧记录一次 pose.txt
+bool save_final_map_on_exit = false;
+float final_map_save_resolution = 0.2f;
+string final_map_save_directory;
+
+bool pose_tilt_compensation_en = false;
+double pose_tilt_roll_deg = 0.0;
+double pose_tilt_pitch_deg = 0.0;
+double pose_tilt_yaw_deg = 0.0;
+M3D pose_tilt_R(Eye3d);
+
+inline V3D applyPoseTiltCompensation(const V3D &p)
+{
+    return pose_tilt_compensation_en ? pose_tilt_R * p : p;
+}
+
+inline Eigen::Quaterniond applyPoseTiltCompensation(const Eigen::Quaterniond &q)
+{
+    if (!pose_tilt_compensation_en)
+        return q;
+    Eigen::Quaterniond q_level(pose_tilt_R);
+    Eigen::Quaterniond out = q_level * q;
+    out.normalize();
+    return out;
+}
+
+inline void fillPoseMsgWithTiltCompensation(geometry_msgs::Pose &pose, const V3D &pos, const Eigen::Quaterniond &rot)
+{
+    V3D pos_level = applyPoseTiltCompensation(pos);
+    Eigen::Quaterniond rot_level = applyPoseTiltCompensation(rot);
+
+    pose.position.x = pos_level(0);
+    pose.position.y = pos_level(1);
+    pose.position.z = pos_level(2);
+    pose.orientation.x = rot_level.x();
+    pose.orientation.y = rot_level.y();
+    pose.orientation.z = rot_level.z();
+    pose.orientation.w = rot_level.w();
+}
 
 
 /**
@@ -325,14 +369,12 @@ void updatePath(const PointTypePose &pose_in)
     pose_stamped.header.stamp = ros::Time().fromSec(pose_in.time);
 
     pose_stamped.header.frame_id = odometryFrame;
-    pose_stamped.pose.position.x =  pose_in.x;
-    pose_stamped.pose.position.y = pose_in.y;
-    pose_stamped.pose.position.z =  pose_in.z;
-    tf::Quaternion q = tf::createQuaternionFromRPY(pose_in.roll, pose_in.pitch, pose_in.yaw);
-    pose_stamped.pose.orientation.x = q.x();
-    pose_stamped.pose.orientation.y = q.y();
-    pose_stamped.pose.orientation.z = q.z();
-    pose_stamped.pose.orientation.w = q.w();
+    V3D pos(pose_in.x, pose_in.y, pose_in.z);
+    Eigen::Quaterniond rot =
+        Eigen::AngleAxisd(double(pose_in.yaw), Eigen::Vector3d::UnitZ()) *
+        Eigen::AngleAxisd(double(pose_in.pitch), Eigen::Vector3d::UnitY()) *
+        Eigen::AngleAxisd(double(pose_in.roll), Eigen::Vector3d::UnitX());
+    fillPoseMsgWithTiltCompensation(pose_stamped.pose, pos, rot);
 
     globalPath.poses.push_back(pose_stamped);
 }
@@ -340,7 +382,7 @@ void updatePath(const PointTypePose &pose_in)
 /**
  * 对点云cloudIn进行变换transformIn，返回结果点云， 修改liosam, 考虑到外参的表示
  */
-pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::Ptr cloudIn, PointTypePose *transformIn)
+pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::Ptr cloudIn, PointTypePose *transformIn, bool apply_output_tilt = false)
 {
     pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
 
@@ -364,9 +406,15 @@ pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::
     for (int i = 0; i < cloudSize; ++i)
     {
         const auto &pointFrom = cloudIn->points[i];
-        cloudOut->points[i].x = transCur(0, 0) * pointFrom.x + transCur(0, 1) * pointFrom.y + transCur(0, 2) * pointFrom.z + transCur(0, 3);
-        cloudOut->points[i].y = transCur(1, 0) * pointFrom.x + transCur(1, 1) * pointFrom.y + transCur(1, 2) * pointFrom.z + transCur(1, 3);
-        cloudOut->points[i].z = transCur(2, 0) * pointFrom.x + transCur(2, 1) * pointFrom.y + transCur(2, 2) * pointFrom.z + transCur(2, 3);
+        V3D p_global(
+            transCur(0, 0) * pointFrom.x + transCur(0, 1) * pointFrom.y + transCur(0, 2) * pointFrom.z + transCur(0, 3),
+            transCur(1, 0) * pointFrom.x + transCur(1, 1) * pointFrom.y + transCur(1, 2) * pointFrom.z + transCur(1, 3),
+            transCur(2, 0) * pointFrom.x + transCur(2, 1) * pointFrom.y + transCur(2, 2) * pointFrom.z + transCur(2, 3));
+        if (apply_output_tilt)
+            p_global = applyPoseTiltCompensation(p_global);
+        cloudOut->points[i].x = p_global(0);
+        cloudOut->points[i].y = p_global(1);
+        cloudOut->points[i].z = p_global(2);
         cloudOut->points[i].intensity = pointFrom.intensity;
     }
     return cloudOut;
@@ -873,6 +921,33 @@ void recontructIKdTree(){
         updateKdtreeCount ++ ; 
 }
 
+void publishOptimizedKeyframeMap()
+{
+    if (cloudKeyPoses6D->empty() || surfCloudKeyFrames.empty())
+        return;
+
+    pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
+    pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
+
+    const int keyframeCount = std::min<int>(cloudKeyPoses6D->size(), surfCloudKeyFrames.size());
+    for (int i = 0; i < keyframeCount; ++i)
+    {
+        *globalSurfCloud += *transformPointCloud(surfCloudKeyFrames[i], &cloudKeyPoses6D->points[i], true);
+    }
+
+    downSizeFilterSurf.setInputCloud(globalSurfCloud);
+    downSizeFilterSurf.setLeafSize(globalMapVisualizationLeafSize, globalMapVisualizationLeafSize, globalMapVisualizationLeafSize);
+    downSizeFilterSurf.filter(*globalSurfCloudDS);
+
+    sensor_msgs::PointCloud2 optimizedMapMsg;
+    pcl::toROSMsg(*globalSurfCloudDS, optimizedMapMsg);
+    optimizedMapMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    optimizedMapMsg.header.frame_id = "camera_init";
+    pubOptimizedGlobalMap.publish(optimizedMapMsg);
+    ROS_INFO_STREAM("Published optimized keyframe map with " << globalSurfCloudDS->size()
+                    << " points from " << keyframeCount << " keyframes");
+}
+
 /**
  * 更新因子图中所有变量节点的位姿，也就是所有历史关键帧的位姿，更新里程计轨迹
  */
@@ -905,6 +980,7 @@ void correctPoses()
         }
         // 清空局部map， reconstruct  ikdtree submap
         recontructIKdTree();
+        publishOptimizedKeyframeMap();
         ROS_INFO("ISMA2 Update");
         aLoopIsClosed = false;
     }
@@ -919,6 +995,11 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
     // 当前关键帧帧
     int loopKeyCur = copy_cloudKeyPoses3D->size() - 1; //  当前关键帧索引
     int loopKeyPre = -1;
+
+    if (lastLoopKeyframeIndex >= 0 && loopKeyCur - lastLoopKeyframeIndex < 50)
+        return false;
+    if (lastLoopTime > 0.0 && lidar_end_time - lastLoopTime < 20.0)
+        return false;
 
     // 当前帧已经添加过闭环对应关系，不再继续添加
     auto it = loopIndexContainer.find(loopKeyCur);
@@ -1078,6 +1159,8 @@ void performLoopClosure()
     mtx.unlock();
 
     loopIndexContainer[loopKeyCur] = loopKeyPre; //   使用hash map 存储回环对
+    lastLoopKeyframeIndex = loopKeyCur;
+    lastLoopTime = lidar_end_time;
 }
 
 //回环检测线程
@@ -1160,6 +1243,7 @@ void RGBpointBodyToWorld(PointType const *const pi, PointType *const po)        
 {
     V3D p_body(pi->x, pi->y, pi->z);
     V3D p_global(state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
+    p_global = applyPoseTiltCompensation(p_global);
 
     po->x = p_global(0);
     po->y = p_global(1);
@@ -1514,10 +1598,13 @@ void logPoseSample(std::ofstream &ofs, int interval, int &counter)
     if (counter % interval != 0)
         return;
 
-    Eigen::Vector3d rpy = state_point.rot.matrix().eulerAngles(2, 1, 0);
-    double roll = rpy(2);
-    double pitch = rpy(1);
-    double yaw = rpy(0);
+    tf::Quaternion q(
+        odomAftMapped.pose.pose.orientation.x,
+        odomAftMapped.pose.pose.orientation.y,
+        odomAftMapped.pose.pose.orientation.z,
+        odomAftMapped.pose.pose.orientation.w);
+    double roll, pitch, yaw;
+    tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
 
     ofs << std::fixed << std::setprecision(6)
         << lidar_end_time << " "
@@ -1690,13 +1777,7 @@ void publish_map(const ros::Publisher &pubLaserCloudMap)
 template <typename T>
 void set_posestamp(T &out)
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
+    fillPoseMsgWithTiltCompensation(out.pose, state_point.pos, Eigen::Quaterniond(state_point.rot.toRotationMatrix()));
 }
 
 void publish_odometry(const ros::Publisher &pubOdomAftMapped)
@@ -1800,7 +1881,78 @@ struct pose
     Eigen::Matrix3d  R;
 };
 
+bool EnsureDirectory(const std::string &dir)
+{
+    if (dir.empty())
+        return false;
+
+    std::string path = dir;
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+
+    std::string current;
+    size_t pos = 0;
+    if (!path.empty() && path[0] == '/')
+    {
+        current = "/";
+        pos = 1;
+    }
+
+    while (pos <= path.size())
+    {
+        size_t next = path.find('/', pos);
+        std::string part = path.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        if (!part.empty())
+        {
+            if (current.size() > 1 && current.back() != '/')
+                current += "/";
+            current += part;
+
+            struct stat st;
+            if (stat(current.c_str(), &st) != 0)
+            {
+                if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST)
+                {
+                    ROS_ERROR_STREAM("Failed to create directory " << current << ": " << strerror(errno));
+                    return false;
+                }
+            }
+            else if (!S_ISDIR(st.st_mode))
+            {
+                ROS_ERROR_STREAM(current << " exists but is not a directory");
+                return false;
+            }
+        }
+
+        if (next == std::string::npos)
+            break;
+        pos = next + 1;
+    }
+
+    return true;
+}
+
+std::string ResolveSaveDirectory(const std::string &destination, const std::string &default_directory)
+{
+    std::string dir = destination.empty() ? default_directory : destination;
+    if (dir.empty())
+        return std::string(ROOT_DIR) + "PCD/";
+
+    if (dir[0] == '/')
+    {
+        if (dir.find("/home/") == 0)
+            return dir;
+        return std::string(std::getenv("HOME")) + dir;
+    }
+
+    return std::string(ROOT_DIR) + dir;
+}
+
 bool CreateFile(std::ofstream& ofs, std::string file_path) {
+    size_t slash_pos = file_path.find_last_of('/');
+    if (slash_pos != std::string::npos)
+        EnsureDirectory(file_path.substr(0, slash_pos));
+
     ofs.open(file_path, std::ios::out);                          //  使用std::ios::out 可实现覆盖
     if(!ofs)
     {
@@ -1831,8 +1983,7 @@ bool savePoseService(fast_lio_sam::save_poseRequest& req, fast_lio_sam::save_pos
     string savePoseDirectory;
     cout << "****************************************************" << endl;
     cout << "Saving poses to pose files ..." << endl;
-    if(req.destination.empty()) savePoseDirectory = std::getenv("HOME") + savePCDDirectory;
-    else savePoseDirectory = std::getenv("HOME") + req.destination;
+    savePoseDirectory = ResolveSaveDirectory(req.destination, savePCDDirectory);
     cout << "Save destination: " << savePoseDirectory << endl;
 
     // create file 
@@ -1877,13 +2028,19 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
     
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files ..." << endl;
-      if(req.destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
-      else saveMapDirectory = std::getenv("HOME") + req.destination;
-      cout << "Save destination: " << saveMapDirectory << endl;
+    saveMapDirectory = ResolveSaveDirectory(req.destination, savePCDDirectory);
+    cout << "Save destination: " << saveMapDirectory << endl;
+    if (!EnsureDirectory(saveMapDirectory))
+    {
+      res.success = false;
+      return false;
+    }
       // 这个代码太坑了！！注释掉
     //   int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
     //   unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
       // 保存历史关键帧位姿
+      try
+      {
       pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);                    // 关键帧位置
       pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);      // 关键帧位姿
       // 提取历史关键帧角点、平面点集合
@@ -1897,7 +2054,7 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
       //cloudKeyPoses6D  转换为T_world_lidar 。 T_world_lidar = T_world_body * T_body_lidar , T_body_lidar 是外参
       for (int i = 0; i < (int)cloudKeyPoses6D->size(); i++) {
             //   *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
-            *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
+            *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i], true);
             cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
       }
 
@@ -1933,13 +2090,20 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
       int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);       //  稠密地图
       res.success = ret == 0;
 
+      // visial optimize global map on viz
+      ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time);
+      string odometryFrame = "camera_init";
+      publishCloud(&pubOptimizedGlobalMap, globalSurfCloudDS, timeLaserInfoStamp, odometryFrame);
+      }
+      catch (const pcl::IOException &e)
+      {
+        ROS_ERROR_STREAM("Failed to save PCD files: " << e.what());
+        res.success = false;
+        return false;
+      }
+
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files completed\n" << endl;
-
-      // visial optimize global map on viz
-    ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time);
-    string odometryFrame = "camera_init";
-    publishCloud(&pubOptimizedGlobalMap, globalSurfCloudDS, timeLaserInfoStamp, odometryFrame);
 
       return true;
 }
@@ -1998,7 +2162,7 @@ void publishGlobalMap()
                 continue;
         int thisKeyInd = (int)globalMapKeyPosesDS->points[i].intensity;
         // *globalMapKeyFrames += *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
-        *globalMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]); //  fast_lio only use  surfCloud
+        *globalMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd], true); //  fast_lio only use  surfCloud
     }
     // 降采样，发布
     pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyFrames;                                                                                   // for global map visualization
@@ -2175,6 +2339,10 @@ int main(int argc, char **argv)
     nh.param<bool>("feature_extract_enable", p_pre->feature_enabled, false);
     nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
     nh.param<int>("publish/pose_log_interval", pose_log_interval, 20);
+    nh.param<bool>("publish/pose_tilt_compensation_en", pose_tilt_compensation_en, false);
+    nh.param<double>("publish/pose_tilt_roll_deg", pose_tilt_roll_deg, 0.0);
+    nh.param<double>("publish/pose_tilt_pitch_deg", pose_tilt_pitch_deg, 0.0);
+    nh.param<double>("publish/pose_tilt_yaw_deg", pose_tilt_yaw_deg, 0.0);
     nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en, true);
     nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
@@ -2232,6 +2400,9 @@ int main(int argc, char **argv)
     // savMap
     nh.param<bool>("savePCD", savePCD, false);
     nh.param<std::string>("savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
+    nh.param<bool>("save_final_map_on_exit", save_final_map_on_exit, false);
+    nh.param<float>("final_map_save_resolution", final_map_save_resolution, 0.2f);
+    nh.param<std::string>("final_map_save_directory", final_map_save_directory, std::string("PCD/"));
 
     downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
     // downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -2246,6 +2417,20 @@ int main(int argc, char **argv)
 
     path.header.stamp = ros::Time::now();
     path.header.frame_id = "camera_init";
+
+    const double deg2rad = M_PI / 180.0;
+    Eigen::Quaterniond pose_tilt_q =
+        Eigen::AngleAxisd(pose_tilt_yaw_deg * deg2rad, Eigen::Vector3d::UnitZ()) *
+        Eigen::AngleAxisd(pose_tilt_pitch_deg * deg2rad, Eigen::Vector3d::UnitY()) *
+        Eigen::AngleAxisd(pose_tilt_roll_deg * deg2rad, Eigen::Vector3d::UnitX());
+    pose_tilt_q.normalize();
+    pose_tilt_R = pose_tilt_q.toRotationMatrix();
+    if (pose_tilt_compensation_en)
+    {
+        ROS_INFO_STREAM("Pose tilt compensation enabled: roll=" << pose_tilt_roll_deg
+                        << " deg, pitch=" << pose_tilt_pitch_deg
+                        << " deg, yaw=" << pose_tilt_yaw_deg << " deg");
+    }
 
     /*** variables definition ***/
     int effect_feat_num = 0, frame_num = 0;
@@ -2312,8 +2497,8 @@ int main(int argc, char **argv)
 
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
-    pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
-    pubOptimizedGlobalMap = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/map_global_optimized", 1); // 发布局部关键帧map的特征点云
+    pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("/fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
+    pubOptimizedGlobalMap = nh.advertise<sensor_msgs::PointCloud2>("/fast_lio_sam/mapping/map_global_optimized", 1, true); // 发布回环优化后的全局关键帧地图
 
     // loop clousre
     // 发布闭环匹配关键帧局部map
@@ -2541,6 +2726,24 @@ int main(int argc, char **argv)
         pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name << endl;
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+    }
+
+    if (save_final_map_on_exit)
+    {
+        ROS_INFO_STREAM("Saving final optimized map on exit to " << std::getenv("HOME") << final_map_save_directory);
+        fast_lio_sam::save_mapRequest map_req;
+        fast_lio_sam::save_mapResponse map_res;
+        map_req.resolution = final_map_save_resolution;
+        map_req.destination = final_map_save_directory;
+        if (!saveMapService(map_req, map_res) || !map_res.success)
+            ROS_WARN("Failed to save final optimized map on exit");
+
+        fast_lio_sam::save_poseRequest pose_req;
+        fast_lio_sam::save_poseResponse pose_res;
+        pose_req.resolution = 0.0f;
+        pose_req.destination = final_map_save_directory;
+        if (!savePoseService(pose_req, pose_res) || !pose_res.success)
+            ROS_WARN("Failed to save final optimized poses on exit");
     }
 
     fout_out.close();
