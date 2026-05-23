@@ -128,6 +128,8 @@ private:
     void multi_thread_rebuild();
     void start_thread();
     void stop_thread();
+public:
+    void safe_rebuild(PointVector point_cloud);
     void run_operation(KD_TREE_NODE ** root, Operation_Logger_Type operation);
     // KD Tree Functions and augmented variables
     int Treesize_tmp = 0, Validnum_tmp = 0;

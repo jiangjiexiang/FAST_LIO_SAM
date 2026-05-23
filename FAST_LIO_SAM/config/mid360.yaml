@@ -4,7 +4,7 @@ common:
     # Ensure your driver publishes CustomMsg on this topic.
     lid_topic:  "/livox/lidar"
     imu_topic:  "/livox/imu"
-    gnss_topic: /gps/fix
+    gnss_topic: /apollo/sensor/gnss/fix
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
 
 preprocess:
@@ -28,9 +28,12 @@ mapping:
                    0, 0, 1 ]
 
     extrinT_Gnss2Lidar: [ 0, 0, 0 ]
-    extrinR_Gnss2Lidar: [ 1, 0, 0,
-                          0, 1, 0,
-                          0, 0, 1 ]
+    # Rotation from GPS ENU frame to SLAM camera_init frame (FRU: X=right, Y=forward, Z=up).
+    # R = Rz(90 - yaw0_deg) where yaw0 = initial vehicle heading in ENU (0=East, CCW positive).
+    # Computed from INS570D initial heading = 79.07 deg (ENU) -> Rz(10.93 deg).
+    extrinR_Gnss2Lidar: [-0.98186,  0.18961, 0.0,
+                         -0.18961, -0.98186, 0.0,
+                          0.0,      0.0,     1.0 ]
 
 publish:
     path_en:  true
@@ -48,7 +51,7 @@ mappingCornerLeafSize: 0.1
 mappingSurfLeafSize: 0.2
 
 # robot motion constraint
-z_tollerance: 1000
+z_tollerance: 1.0          # constrain Z drift to ~1m (set higher if vehicle goes up/down ramps)
 rotation_tollerance: 1000
 
 # CPU params
@@ -63,19 +66,21 @@ surroundingKeyframeSearchRadius: 50.0
 
 # Loop closure
 loopClosureEnableFlag: true
-loopClosureFrequency: 4.0
-surroundingKeyframeSize: 50
+loopClosureFrequency: 1.0
+surroundingKeyframeSize: 30
 historyKeyframeSearchRadius: 10.0
 historyKeyframeSearchTimeDiff: 30.0
-historyKeyframeSearchNum: 20
+historyKeyframeSearchNum: 10
 historyKeyframeFitnessScore: 0.3
 loopClosureWeight: 4.0
 
 # GPS settings
 useImuHeadingInitialization: false
-useGpsElevation: false
+useGpsElevation: true
 gpsCovThreshold: 2.0
 poseCovThreshold: 0
+gpsPosThreshold: 3.0       # GPS与LiDAR位置偏差超过此值(m)视为不准
+gpsDisableDuration: 3.0    # 连续不准超过此时间(s)后停止耦合
 
 # Visualization
 globalMapVisualizationSearchRadius: 100.0
@@ -86,4 +91,4 @@ recontructKdTree: true
 
 # Export settings
 savePCD: true
-savePCDDirectory: "/fast_lio_sam_ws/src/FAST_LIO_SAM/PCD/"
+savePCDDirectory: "/ws_fast-lio-sam/src/FAST_LIO_SAM/FAST_LIO_SAM/PCD/"

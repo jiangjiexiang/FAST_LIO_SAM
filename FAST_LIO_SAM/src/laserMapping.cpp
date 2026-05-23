@@ -290,6 +290,11 @@ bool useImuHeadingInitialization;
 bool useGpsElevation;             //  是否使用gps高层优化
 float gpsCovThreshold;          //   gps方向角和高度差的协方差阈值
 float poseCovThreshold;       //  位姿协方差阈值  from isam2
+float gpsPosThreshold;        //  GPS与LiDAR位置偏差阈值(m)，超过则认为GPS不准
+double gpsDisableDuration;    //  GPS连续不准超过此时间(s)后停止耦合
+double gps_bad_start_time = -1.0;  //  GPS开始不准的时间戳
+bool gps_coupling_active = true;   //  当前是否允许GPS耦合
+bool gps_factor_ever_added = false; //  是否已成功添加过GPS因子（坐标系对齐后才比较）
 
 M3D Gnss_R_wrt_Lidar(Eye3d) ;         // gnss  与 imu 的外参
 V3D Gnss_T_wrt_Lidar(Zero3d);
@@ -691,7 +696,7 @@ void addGPSFactor()
             float noise_x = thisGPS.pose.covariance[0];         //  x 方向的协方差
             float noise_y = thisGPS.pose.covariance[7];
             float noise_z = thisGPS.pose.covariance[14];      //   z(高层)方向的协方差
-            if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
+            if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold || (useGpsElevation && noise_z > gpsCovThreshold))
                 continue;
             // GPS里程计位置
             float gps_x = thisGPS.pose.pose.position.x;
@@ -706,6 +711,33 @@ void addGPSFactor()
             // (0,0,0)无效数据
             if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
                 continue;
+
+            // 坐标系对齐后，检测GPS与LiDAR位置偏差，持续超过阈值则停止耦合
+            if (gps_factor_ever_added) {
+                float dx = gps_x - transformTobeMapped[3];
+                float dy = gps_y - transformTobeMapped[4];
+                float gps_lidar_dist = sqrt(dx*dx + dy*dy);
+                if (gps_lidar_dist > gpsPosThreshold) {
+                    if (gps_bad_start_time < 0)
+                        gps_bad_start_time = lidar_end_time;
+                    if (lidar_end_time - gps_bad_start_time > gpsDisableDuration) {
+                        if (gps_coupling_active) {
+                            gps_coupling_active = false;
+                            ROS_WARN("GPS coupling disabled: XY deviation %.2fm for %.0fs (threshold %.1fm/%.0fs)",
+                                     gps_lidar_dist, lidar_end_time - gps_bad_start_time,
+                                     gpsPosThreshold, gpsDisableDuration);
+                        }
+                    }
+                } else {
+                    gps_bad_start_time = -1.0;
+                    if (!gps_coupling_active) {
+                        gps_coupling_active = true;
+                        ROS_INFO("GPS coupling re-enabled: XY deviation %.2fm", gps_lidar_dist);
+                    }
+                }
+                if (!gps_coupling_active)
+                    continue;
+            }
             // 每隔5m添加一个GPS里程计
             PointType curGPSPoint;
             curGPSPoint.x = gps_x;
@@ -722,6 +754,7 @@ void addGPSFactor()
             gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
             gtSAMgraph.add(gps_factor);
             aLoopIsClosed = true;
+            gps_factor_ever_added = true;
             ROS_INFO("GPS Factor Added");
             break;
         }
@@ -740,15 +773,23 @@ void saveKeyFramesAndFactor()
     // 闭环因子 (rs-loop-detect)  基于欧氏距离的检测
     addLoopFactor();
     // 执行优化
-    isam->update(gtSAMgraph, initialEstimate);
-    isam->update();
-    if (aLoopIsClosed == true) // 有回环因子，多update几次
-    {
+    try {
+        isam->update(gtSAMgraph, initialEstimate);
         isam->update();
-        isam->update();
-        isam->update();
-        isam->update();
-        isam->update();
+        if (aLoopIsClosed == true) // 有回环因子，多update几次
+        {
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+        }
+    } catch (const std::exception& e) {
+        ROS_WARN("GTSAM update failed: %s — skipping this factor graph update.", e.what());
+        gtSAMgraph.resize(0);
+        initialEstimate.clear();
+        aLoopIsClosed = false;
+        return;
     }
     // update之后要清空一下保存的因子图，注：历史数据不会清掉，ISAM保存起来了
     gtSAMgraph.resize(0);
@@ -851,6 +892,8 @@ void recontructIKdTree(){
             if (pointDistance(subMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > globalMapVisualizationSearchRadius)
                     continue;
             int thisKeyInd = (int)subMapKeyPosesDS->points[i].intensity;
+            if (thisKeyInd < 0 || thisKeyInd >= (int)surfCloudKeyFrames.size())
+                continue;
             // *globalMapKeyFrames += *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
             *subMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]); //  fast_lio only use  surfCloud
         }
@@ -862,7 +905,7 @@ void recontructIKdTree(){
 
         std::cout << "subMapKeyFramesDS sizes  =  "   << subMapKeyFramesDS->points.size()  << std::endl;
         
-        ikdtree.reconstruct(subMapKeyFramesDS->points);
+        ikdtree.safe_rebuild(subMapKeyFramesDS->points);
         updateKdtreeCount = 0;
         ROS_INFO("Reconstructed  ikdtree ");
         int featsFromMapNum = ikdtree.validnum();
@@ -1102,6 +1145,15 @@ void SigHandle(int sig)
     flg_exit = true;
     ROS_WARN("catch sig %d", sig);
     sig_buffer.notify_all();
+    // save PCD immediately on signal to avoid being killed by SIGTERM before main() cleanup
+    if (pcl_wait_save && pcl_wait_save->size() > 0 && pcd_save_en)
+    {
+        string file_name = string("scans.pcd");
+        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        printf("[SigHandle] PCD saved to %s (%zu points)\n", all_points_dir.c_str(), pcl_wait_save->size());
+    }
 }
 
 inline void dump_lio_state_to_log(FILE *fp)
@@ -1389,9 +1441,11 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU  ???  调试结果好像是 NED 北东地
 
         Eigen::Matrix4d gnss_pose = Eigen::Matrix4d::Identity();
-        gnss_pose(0,3) = gnss_data.local_N ;                 //    北
-        gnss_pose(1,3) = gnss_data.local_E ;                 //     东
-        gnss_pose(2,3) = -gnss_data.local_U ;                 //    地
+        // GeographicLib::LocalCartesian::Forward returns ENU: local_E=East, local_N=North, local_U=Up
+        // Use ENU directly to match GTSAM GPSFactor convention (X=East, Y=North, Z=Up)
+        gnss_pose(0,3) = gnss_data.local_E ;                 //    东 (East)
+        gnss_pose(1,3) = gnss_data.local_N ;                 //    北 (North)
+        gnss_pose(2,3) = gnss_data.local_U ;                 //    天 (Up)
 
         Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar) ;
         gnss_to_lidar.pretranslate(Gnss_T_wrt_Lidar);
@@ -1412,6 +1466,10 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_data_enu.pose.covariance[0] = gnss_data.pose_cov[0] ;
         gnss_data_enu.pose.covariance[7] = gnss_data.pose_cov[1] ;
         gnss_data_enu.pose.covariance[14] = gnss_data.pose_cov[2] ;
+
+        // 只有 RTK 固定解 (STATUS_GBAS_FIX=2) 才入缓冲参与耦合
+        if (gnss_data.status < sensor_msgs::NavSatStatus::STATUS_GBAS_FIX)
+            return;
 
         gnss_buffer.push_back(gnss_data_enu);
 
@@ -2189,6 +2247,8 @@ int main(int argc, char **argv)
     nh.param<bool>("useGpsElevation", useGpsElevation, false);
     nh.param<float>("gpsCovThreshold", gpsCovThreshold, 2.0);
     nh.param<float>("poseCovThreshold", poseCovThreshold, 25.0);
+    nh.param<float>("gpsPosThreshold", gpsPosThreshold, 3.0);
+    nh.param<double>("gpsDisableDuration", gpsDisableDuration, 10.0);
 
 
     // Visualization

@@ -1296,6 +1296,16 @@ bool KD_TREE::point_cmp_z(PointType a, PointType b) { return a.z < b.z;}
  * @brief 删除当前所有的点云缓存，根据输入的点云，重新构造ikdtree
  * @param point_cloud 输入的点云
  */
+void KD_TREE::safe_rebuild(PointVector point_cloud){
+    stop_thread();
+    Delete_Storage_Disabled = true;
+    delete_tree_nodes(&Root_Node);
+    PointVector ().swap(PCL_Storage);
+    Rebuild_Logger.clear();
+    Build(point_cloud);
+    start_thread();
+}
+
 void KD_TREE::reconstruct(PointVector point_cloud){
     Delete_Storage_Disabled = true;
     delete_tree_nodes(&Root_Node);
