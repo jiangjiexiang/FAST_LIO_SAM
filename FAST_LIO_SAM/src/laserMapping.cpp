@@ -728,6 +728,8 @@ void addGPSFactor()
                                      gpsPosThreshold, gpsDisableDuration);
                         }
                     }
+                    // 偏差超标时立即跳过，不等计时结束，避免坏的GPS factor污染位姿图
+                    continue;
                 } else {
                     gps_bad_start_time = -1.0;
                     if (!gps_coupling_active) {
@@ -756,6 +758,13 @@ void addGPSFactor()
             aLoopIsClosed = true;
             gps_factor_ever_added = true;
             ROS_INFO("GPS Factor Added");
+            // 只在因子真正加入时才追加可视化路径点，避免GPS路径超前于雷达路径
+            msg_gnss_pose.header.frame_id = "camera_init";
+            msg_gnss_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
+            msg_gnss_pose.pose.position.x = gps_x;
+            msg_gnss_pose.pose.position.y = gps_y;
+            msg_gnss_pose.pose.position.z = gps_z;
+            gps_path.poses.push_back(msg_gnss_pose);
             break;
         }
     }
@@ -1140,6 +1149,8 @@ void loopClosureThread()
     }
 }
 
+extern PointCloudXYZI::Ptr pcl_wait_save;
+
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -1472,16 +1483,6 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
             return;
 
         gnss_buffer.push_back(gnss_data_enu);
-
-        // visial gnss path in rviz:
-        msg_gnss_pose.header.frame_id = "camera_init";
-        msg_gnss_pose.header.stamp = ros::Time().fromSec(gnss_data.time);
-
-        msg_gnss_pose.pose.position.x = gnss_pose(0,3) ;  
-        msg_gnss_pose.pose.position.y = gnss_pose(1,3) ;
-        msg_gnss_pose.pose.position.z = gnss_pose(2,3) ;
-
-        gps_path.poses.push_back(msg_gnss_pose);
 
         //  save_gnss path
         PointTypePose thisPose6D;  
@@ -2595,6 +2596,9 @@ int main(int argc, char **argv)
 
     startFlag = false;
     loopthread.join(); //  分离线程
+
+    if (savePCD)
+        saveMap();
 
     return 0;
 }

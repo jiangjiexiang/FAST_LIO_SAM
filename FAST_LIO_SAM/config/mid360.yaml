@@ -10,7 +10,7 @@ common:
 preprocess:
     lidar_type: 1               # 1: Livox serials (CustomMsg)
     scan_line: 6
-    blind: 1.0
+    blind: 5.0
 
 mapping:
     acc_cov: 0.1
