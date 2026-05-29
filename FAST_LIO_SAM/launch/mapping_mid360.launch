@@ -14,6 +14,11 @@
     <param name="runtime_pos_log_enable" type="bool" value="0" />
     <node pkg="fast_lio_sam" type="fastlio_sam_mapping" name="laserMapping" output="screen" />
 
+    <!-- 实时记录 LIO + RTK 位姿到 CSV，各自独立保存 -->
+    <arg name="log_output" default="/tmp/mapping_log" />
+    <node pkg="fast_lio_sam" type="log_lio_rtk.py" name="lio_rtk_logger"
+          args="--output_dir $(arg log_output)" output="screen" />
+
     <group if="$(arg rviz)">
     <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_lio_sam)/rviz_cfg/loam_livox.rviz" />
     </group>
